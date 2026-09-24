@@ -1,0 +1,29 @@
+stream:
+  name: E1_time_continual
+  version: "1.0"
+
+events:
+  - event_id: 0
+    name: base
+    train_source: null
+    eval_source: null
+
+  - event_id: 1
+    name: event_1
+    train_source: null
+    eval_source: null
+
+  - event_id: 2
+    name: event_2
+    train_source: null
+    eval_source: null
+
+  - event_id: 3
+    name: event_3
+    train_source: null
+    eval_source: null
+
+  - event_id: 4
+    name: event_4
+    train_source: null
+    eval_source: null

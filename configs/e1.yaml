@@ -1,0 +1,43 @@
+# CYCLEFT v2.0
+# E1 — Real Continual Adaptation
+
+experiment:
+  name: E1_real_continual_adaptation
+  seed: 42
+
+model:
+  name: LLaMA-3.1-8B
+  primary: true
+
+data:
+  stream_type: sequential_domain_time
+  stream:
+    - general_base
+    - domain_a
+    - domain_a_update
+    - domain_b
+    - domain_b_update
+    - mixed_shifted
+
+  dataset: null
+
+training:
+  method: QLoRA
+
+evaluation:
+  new_domain_quality: true
+  old_domain_quality_pre: true
+  old_domain_quality_post: true
+  forgetting: true
+  average_performance: true
+  forward_transfer: true
+  backward_transfer: true
+
+systems_metrics:
+  training_tokens: true
+  training_time: true
+  gpu_hours: true
+
+logging:
+  save_cycle_results: true
+  save_raw_metrics: true

@@ -8,7 +8,15 @@ version = "2.0.0"
 requires-python = ">=3.11"
 
 dependencies = [
+    "accelerate>=1.15.0",
+    "datasets>=5.1.0",
+    "matplotlib>=3.11.2",
+    "peft>=0.21.2",
     "pyyaml>=6.0",
+    "river>=0.27.0",
+    "safetensors>=0.8.0",
+    "torch>=2.14.1",
+    "transformers>=5.21.0",
 ]
 
 [tool.setuptools.packages.find]

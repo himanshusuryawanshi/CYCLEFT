@@ -1,34 +1,71 @@
-from cycleft.config import load_config
 
-def test_load_config():
-    config = load_config("configs/base.yaml")
+import pytest
 
-    assert config["project"]["name"] == "CYCLEFT"
-    assert config["project"]["version"] == "2.0"
-    assert config["experiment"]["seed"] == 42
+from cycleft.config import validate_stream_config
 
-def test_e1_config():
-    config = load_config("configs/e1.yaml")
 
-    assert config["experiment"]["name"] == "E1_real_continual_adaptation"
-    assert config["experiment"]["seed"] == 42
+def valid_config():
+    return {
+        "stream": {
+            "dataset": {
+                "name": "example",
+                "source": "example/dataset",
+            },
+            "selected_slices": ["slice_1"],
+            "events": [
+                {
+                    "event_id": 0,
+                    "name": "base",
+                    "train_source": None,
+                    "eval_source": None,
+                },
+                {
+                    "event_id": 1,
+                    "name": "update_1",
+                    "train_source": "train:slice_1",
+                    "eval_source": "test:slice_1",
+                },
+            ],
+        }
+    }
 
-    assert config["model"]["name"] == "LLaMA-3.1-8B"
 
-    assert config["data"]["stream_type"] == "sequential_domain_time"
+def test_valid_stream_config():
+    validate_stream_config(valid_config())
 
-    assert config["evaluation"]["new_domain_quality"] is True
-    assert config["evaluation"]["forgetting"] is True
 
-def test_e1_tic_lm_stream_config():
-    config = load_config("configs/e1_stream.yaml")
+def test_duplicate_event_ids_rejected():
+    config = valid_config()
+    config["stream"]["events"][1]["event_id"] = 0
 
-    stream = config["stream"]
+    with pytest.raises(ValueError, match="unique"):
+        validate_stream_config(config)
 
-    assert stream["name"] == "E1_tic_lm_temporal"
-    assert stream["dataset"]["name"] == "TiC-LM"
-    assert stream["type"] == "temporal"
 
-    assert len(stream["events"]) == 5
-    assert stream["events"][0]["name"] == "base"
-    assert stream["events"][1]["name"] == "temporal_update_1"
+def test_unordered_events_rejected():
+    config = valid_config()
+    config["stream"]["events"].reverse()
+
+    with pytest.raises(ValueError, match="ordered"):
+        validate_stream_config(config)
+
+
+def test_missing_dataset_source_rejected():
+    config = valid_config()
+    config["stream"]["dataset"]["source"] = ""
+
+    with pytest.raises(ValueError, match="dataset field"):
+        validate_stream_config(config)
+
+
+def test_duplicate_slices_rejected():
+    config = valid_config()
+    config["stream"]["selected_slices"] = ["slice_1", "slice_1"]
+
+    with pytest.raises(ValueError, match="duplicates"):
+        validate_stream_config(config)
+
+
+def test_null_base_sources_are_allowed():
+    config = valid_config()
+    validate_stream_config(config)

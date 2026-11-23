@@ -1,19 +1,22 @@
+
 # CYCLEFT v2.0
-# E1 — TiC-LM Temporal Continual Adaptation
+# E1 — Temporal Continual Adaptation (development dataset)
 
 stream:
-  name: E1_tic_lm_temporal
-  version: "1.0"
+  name: E1_temporalwiki_drift_easy
+  version: "1.1"
 
   dataset:
-    name: TiC-LM
-    source: apple/ml-tic-lm
+    name: temporalwiki-drift-cl-easy
+    source: saxenan3/temporalwiki-drift-cl-easy
+    license: CC-BY-SA-4.0
 
   type: temporal
 
-  # Exact slices will be frozen after inspecting
-  # the available TiC-LM metadata.
-  selected_slices: []
+  selected_slices:
+    - pair_20251120_20251201
+    - pair_20251201_20260101
+    - pair_20260101_20260201
 
   events:
     - event_id: 0
@@ -22,21 +25,54 @@ stream:
       eval_source: null
 
     - event_id: 1
-      name: temporal_update_1
-      train_source: null
-      eval_source: null
+      name: nov_to_dec
+      train_source: "train:slice_tag=pair_20251120_20251201"
+      eval_source: "test:slice_tag=pair_20251120_20251201"
 
     - event_id: 2
-      name: temporal_update_2
-      train_source: null
-      eval_source: null
+      name: dec_to_jan
+      train_source: "train:slice_tag=pair_20251201_20260101"
+      eval_source: "test:slice_tag=pair_20251201_20260101"
 
     - event_id: 3
-      name: temporal_update_3
-      train_source: null
-      eval_source: null
+      name: jan_to_feb
+      train_source: "train:slice_tag=pair_20260101_20260201"
+      eval_source: "test:slice_tag=pair_20260101_20260201"
 
-    - event_id: 4
-      name: temporal_update_4
-      train_source: null
-      eval_source: null
+# E1 experiment settings (sequential LoRA adaptation of a real LLM).
+e1:
+  model_id: meta-llama/Llama-3.2-1B-Instruct
+  seed: 42
+  # 'auto' -> MPS preferred; CPU is opt-in only (never a silent fallback).
+  device: null
+  max_length: 128
+  # Frozen chat-template date keeps prompts reproducible across calendar days.
+  chat_date_string: "01 Jan 2026"
+  system_prompt: "You are a precise question answering assistant. Answer with the exact answer only, no explanation."
+
+  evaluation:
+    decoding: greedy
+    max_new_tokens: 24
+
+  # 'pilot' is a small deterministic subset for fast iteration;
+  # 'full' uses every available training example per event (500).
+  # Evaluation always uses ALL held-out test examples regardless of mode.
+  modes:
+    pilot:
+      train_examples_per_event: 64
+    full:
+      train_examples_per_event: null
+
+  training:
+    # 1e-4 destabilized generation on this fp16/MPS setup (train loss fell
+    # but outputs degenerated, see results/e1/pilot_20261113_aborted_lr1e4);
+    # 2e-5 produces coherent greedy generations and is the standard LoRA lr.
+    learning_rate: 2.0e-5
+    batch_size: 1
+    gradient_accumulation_steps: 1
+    epochs: 1
+    max_grad_norm: 1.0
+    lora_r: 8
+    lora_alpha: 16
+    lora_dropout: 0.05
+    lora_target_modules: [q_proj, k_proj, v_proj, o_proj]

@@ -2,4 +2,12 @@ Metadata-Version: 2.4
 Name: cycleft
 Version: 2.0.0
 Requires-Python: >=3.11
+Requires-Dist: accelerate>=1.15.0
+Requires-Dist: datasets>=5.1.0
+Requires-Dist: matplotlib>=3.11.2
+Requires-Dist: peft>=0.21.2
 Requires-Dist: pyyaml>=6.0
+Requires-Dist: river>=0.27.0
+Requires-Dist: safetensors>=0.8.0
+Requires-Dist: torch>=2.14.1
+Requires-Dist: transformers>=5.21.0

@@ -15,6 +15,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
+from cycleft.data.base import DATASET_TEMPORALWIKI, DATASET_WIKIFACTDIFF
 from cycleft.data.temporalwiki import DATASET_ID, SLICE_TAGS
 
 QUESTION_COLUMN = "question"
@@ -128,20 +129,46 @@ def prepare_event_datasets(
     train_limit: int | None = None,
     eval_limit: int | None = None,
     seed: int = 42,
+    dataset: str = DATASET_TEMPORALWIKI,
+    dataset_config: dict[str, Any] | None = None,
 ) -> tuple[list[PreparedEvent], dict[str, Any]]:
-    """Prepare all temporal events plus a serializable manifest.
+    """Prepare all continual-learning events plus a serializable manifest.
+
+    Dataset dispatch: the default ``dataset="temporalwiki"`` preserves the
+    original E1 behaviour byte-for-byte (E2–E7 call this function without
+    the new keyword arguments).  ``dataset="wikifactdiff"`` delegates to
+    the WikiFactDiff adapter (``cycleft.data.wikifactdiff``), which
+    implements its own event definitions, subject-disjoint partitioning
+    and leakage masks; ``slice_tags`` is ignored for it.
 
     Args:
-        slice_tags: Temporal slices in stream order.
+        slice_tags: Temporal slices in stream order (TemporalWiki only).
         train_limit: Training examples per event (``None`` = all).
         eval_limit: Reserved for debugging; must stay ``None`` in real
             runs. The evaluation set is never reduced to inflate scores.
         seed: Seed controlling the deterministic training subset.
+        dataset: Registered dataset adapter name.
+        dataset_config: Adapter-specific options (pilot eval populations,
+            split fractions, subset name, ...).
     """
     if eval_limit is not None:
         raise ValueError(
             "eval_limit is only for throwaway debugging; E1 always "
             "evaluates the full held-out test set."
+        )
+
+    if dataset == DATASET_WIKIFACTDIFF:
+        from cycleft.data.wikifactdiff import prepare_wikifactdiff_events
+
+        return prepare_wikifactdiff_events(
+            train_limit=train_limit,
+            seed=seed,
+            dataset_config=dataset_config or {},
+        )
+    if dataset != DATASET_TEMPORALWIKI:
+        raise ValueError(
+            f"Unknown dataset adapter {dataset!r}; expected "
+            f"{DATASET_TEMPORALWIKI!r} or {DATASET_WIKIFACTDIFF!r}."
         )
 
     train_splits, train_fingerprint = load_slice_rows("train", slice_tags)

@@ -203,10 +203,22 @@ class E1Run:
         print(f"[e1:{self.run_id}] {message}", flush=True)
 
     def prepare(self) -> tuple[list[PreparedEvent], dict]:
-        self.log(f"Preparing datasets (train_limit={self.train_limit}, seed={self.lm_config.seed})")
+        dataset_name = (
+            self.resolved_config.get("stream", {}).get("dataset", {}).get("name")
+            or "temporalwiki"
+        )
+        dataset_config = (
+            self.resolved_config.get("stream", {}).get("dataset", {}).get("adapter", {})
+        )
+        self.log(
+            f"Preparing datasets (dataset={dataset_name}, "
+            f"train_limit={self.train_limit}, seed={self.lm_config.seed})"
+        )
         events, manifest = prepare_event_datasets(
             train_limit=self.train_limit,
             seed=self.lm_config.seed,
+            dataset=dataset_name,
+            dataset_config=dataset_config,
         )
         for event in events:
             self.log(

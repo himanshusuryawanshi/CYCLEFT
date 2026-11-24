@@ -46,9 +46,15 @@ def main() -> None:
 
     seed = args.seed if args.seed is not None else int(e1_section.get("seed", 42))
 
+    stream = raw_config.get("stream", {})
+    dataset_name = stream.get("dataset", {}).get("name", "temporalwiki")
+    dataset_config = stream.get("dataset", {}).get("adapter", {})
+
     events, manifest = prepare_event_datasets(
         train_limit=train_limit,
         seed=seed,
+        dataset=dataset_name,
+        dataset_config=dataset_config,
     )
 
     out_path = Path(args.out) if args.out else REPO_ROOT / "data" / "e1" / "dataset_manifest.json"
@@ -56,13 +62,15 @@ def main() -> None:
 
     print(f"Manifest written to {out_path}")
     for event in events:
-        overlap = manifest["events"][event.event_id - 1]["train_eval_overlap"]
-        print(
-            f"  event {event.event_id} ({event.slice_tag}): "
-            f"train {len(event.train_rows)}/{event.train_pool_size}, "
-            f"eval {event.eval_pool_size}, "
-            f"exact question overlap train/test = {overlap['exact_question_overlap']}"
-        )
+        event_meta = manifest["events"][event.event_id - 1]
+        n_train = len(event.train_rows)
+        n_eval = event.eval_pool_size
+        line = (f"  event {event.event_id} ({event.slice_tag}): "
+                f"train {n_train}, eval {n_eval}")
+        overlap = event_meta.get("train_eval_overlap")
+        if overlap:
+            line += f", exact question overlap train/test = {overlap['exact_question_overlap']}"
+        print(line)
 
 
 if __name__ == "__main__":

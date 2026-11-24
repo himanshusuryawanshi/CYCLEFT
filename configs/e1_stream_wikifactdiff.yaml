@@ -1,0 +1,84 @@
+# CYCLEFT v2.0
+# E1 — WikiFactDiff continual knowledge-update adaptation
+# (new dataset adapter; the TemporalWiki baseline in configs/e1_stream.yaml
+#  remains frozen and untouched)
+
+stream:
+  name: E1_wikifactdiff_updates
+  version: "1.0"
+
+  dataset:
+    name: wikifactdiff
+    source: Orange/WikiFactDiff
+    config: 20210104-20230227_legacy
+    revision: "bb17ffbff7b2d28e4cd12e251af3db50d7fa18ea"
+    license: CC-BY-SA-4.0
+    paper: "https://aclanthology.org/2024.lrec-main.1532/"
+    adapter:
+      # partition: wfd-partition-v1 (subject-disjoint 80/10/10,
+      # relation-aware stratification, salt below)
+      salt: "cycleft-wfd-v1"
+      split_fractions: [0.80, 0.90]
+      # eval_population: "pilot" (deterministic stratified sample) or
+      # "full" (complete held-out populations; HPC runs)
+      eval_population: "pilot"
+      pilot_eval_per_event: 100
+
+  type: semantic_update
+
+  selected_slices:
+    - wfd_e1_insertion
+    - wfd_e2_other_update
+    - wfd_e3_replacement
+
+  events:
+    - event_id: 0
+      name: base
+      train_source: null
+      eval_source: null
+
+    - event_id: 1
+      name: insertion
+      train_source: "train:wfd_e1_insertion"
+      eval_source: "test:wfd_e1_insertion"
+
+    - event_id: 2
+      name: other_update
+      train_source: "train:wfd_e2_other_update"
+      eval_source: "test:wfd_e2_other_update"
+
+    - event_id: 3
+      name: replacement
+      train_source: "train:wfd_e3_replacement"
+      eval_source: "test:wfd_e3_replacement"
+
+# Training hyperparameters are IDENTICAL to the TemporalWiki baseline
+# (dataset migration must not be confounded with training changes).
+e1:
+  model_id: meta-llama/Llama-3.2-1B-Instruct
+  seed: 42
+  device: null            # 'auto' -> MPS locally; HPC GPU set via --device
+  max_length: 128
+  chat_date_string: "01 Jan 2026"
+  system_prompt: "You are a precise question answering assistant. Answer with the exact answer only, no explanation."
+
+  evaluation:
+    decoding: greedy
+    max_new_tokens: 24
+
+  modes:
+    pilot:
+      train_examples_per_event: 64
+    full:
+      train_examples_per_event: null
+
+  training:
+    learning_rate: 2.0e-5
+    batch_size: 1
+    gradient_accumulation_steps: 1
+    epochs: 1
+    max_grad_norm: 1.0
+    lora_r: 8
+    lora_alpha: 16
+    lora_dropout: 0.05
+    lora_target_modules: [q_proj, k_proj, v_proj, o_proj]

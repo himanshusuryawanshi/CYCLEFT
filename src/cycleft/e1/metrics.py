@@ -220,3 +220,38 @@ def mean(values: Sequence[float]) -> float:
     if not values:
         raise ValueError("Cannot average an empty sequence.")
     return sum(values) / len(values)
+
+
+# ---------------------------------------------------------------------------
+# Multi-reference evaluation (WikiFactDiff adapter; single-reference
+# behaviour above is unchanged for TemporalWiki).
+# ---------------------------------------------------------------------------
+
+
+def exact_match_multi(
+    prediction: str,
+    references: Sequence[str],
+) -> float:
+    """1.0 when the normalized prediction equals ANY normalized reference.
+
+    Used for facts with several simultaneously valid answers (e.g. a
+    WikiFactDiff row with multiple ``new`` objects).  An empty reference
+    list yields 0.0: with no valid post-update answer, the prediction
+    cannot be correct.
+    """
+    if not references:
+        return 0.0
+    normalized_prediction = normalize_answer(prediction)
+    return float(
+        any(normalized_prediction == normalize_answer(ref) for ref in references)
+    )
+
+
+def token_f1_multi(
+    prediction: str,
+    references: Sequence[str],
+) -> float:
+    """Maximum token-F1 over all references (0.0 for an empty list)."""
+    if not references:
+        return 0.0
+    return max(token_f1(prediction, ref) for ref in references)

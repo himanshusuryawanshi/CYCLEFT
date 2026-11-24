@@ -520,7 +520,7 @@ def evaluate_event(
     Returns per-event metrics plus per-example prediction records for
     later inspection.
     """
-    from cycleft.e1.metrics import exact_match, token_f1
+    from cycleft.e1.metrics import exact_match, exact_match_multi, token_f1, token_f1_multi
 
     emit = log or (lambda message: None)
     started = time.perf_counter()
@@ -535,11 +535,19 @@ def evaluate_event(
     for index, row in enumerate(eval_rows):
         question = str(row["question"])
         reference = str(row["object"])
+        valid_answers = row.get("valid_answers")
         raw = generate_answer(model, tokenizer, question, config)
         prediction = extract_answer(raw)
 
-        em = exact_match(prediction, reference)
-        f1 = token_f1(prediction, reference)
+        if valid_answers:
+            # Multi-reference scoring (WikiFactDiff rows with several
+            # simultaneously valid answers).  ``object`` remains the
+            # primary answer for provenance; any valid answer counts.
+            em = exact_match_multi(prediction, valid_answers)
+            f1 = token_f1_multi(prediction, valid_answers)
+        else:
+            em = exact_match(prediction, reference)
+            f1 = token_f1(prediction, reference)
         records.append(
             {
                 "example_index": index,
@@ -549,6 +557,11 @@ def evaluate_event(
                 "prediction": prediction,
                 "exact_match": em,
                 "token_f1": f1,
+                **(
+                    {"valid_answers": list(valid_answers)}
+                    if valid_answers
+                    else {}
+                ),
             }
         )
         if (index + 1) % 10 == 0:

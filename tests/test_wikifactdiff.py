@@ -204,7 +204,7 @@ def test_degenerate_and_obsolete_only_handling(synthetic_rows):
     )
     # obsolete-only row S6 excluded from training, kept as persistence probe
     assert all(ex["subject_id"] != "S6" for ex in all_train)
-    probes = manifest["sweep_rows"]["m3_persistence_probes"]
+    probes = manifest["sweep_rows_sample"]["m3_persistence_probes"]
     assert any(p["subject_id"] == "S6" for p in probes)
     assert all(p["valid_answers"] == [] for p in probes)
 
@@ -261,14 +261,14 @@ def test_prompt_mask_exclusions_recorded(synthetic_rows):
     # S3 appears as a dataset row AND as a neighbor of S8; its update prompt
     # is a train prompt -> the S3-neighbor probe must be excluded.
     _, manifest = build_wikifactdiff_events(synthetic_rows, seed=42)
-    probes = manifest["sweep_rows"]["m3_neighborhood_probes"]
+    probes = manifest["sweep_rows_sample"]["m3_neighborhood_probes"]
     assert all(p["subject_id"] != "S3" for p in probes)
     assert manifest["counts"]["neighborhood_excluded_occurrences"] >= 1
 
 
 def test_neighborhood_probes_deduplicated_and_exclusion_filtered(synthetic_rows):
     _, manifest = build_wikifactdiff_events(synthetic_rows, seed=42)
-    probes = manifest["sweep_rows"]["m3_neighborhood_probes"]
+    probes = manifest["sweep_rows_sample"]["m3_neighborhood_probes"]
     # duplicate probe (N2 appears in two rows' neighborhoods) kept once
     n2 = [p for p in probes if p["subject_id"] == "N2"]
     assert len(n2) == 1

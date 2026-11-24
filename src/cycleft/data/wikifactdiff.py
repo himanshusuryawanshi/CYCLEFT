@@ -579,10 +579,13 @@ def build_wikifactdiff_events(
             "m3_persistence_probes": len(persistence_rows),
             "m3_neighborhood_probes": len(neighborhood_rows),
         },
-        "sweep_rows": {
-            "m1_trained_fact_paraphrases": m1_rows,
-            "m3_persistence_probes": persistence_rows,
-            "m3_neighborhood_probes": neighborhood_rows,
+        # The full sweep populations are deterministically re-derivable from
+        # (dataset revision, salt, fractions, seed) — the manifest carries
+        # only counts plus a capped sample for auditability.
+        "sweep_rows_sample": {
+            "m1_trained_fact_paraphrases": m1_rows[:200],
+            "m3_persistence_probes": persistence_rows[:200],
+            "m3_neighborhood_probes": neighborhood_rows[:200],
         },
         "notes": [
             "One training example per valid new object; exact duplicate "

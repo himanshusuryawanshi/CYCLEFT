@@ -282,7 +282,7 @@ class E1Run:
             self.log(
                 f"    EM={result['metrics']['exact_match']:.3f} "
                 f"F1={result['metrics']['token_f1']:.3f} "
-                f"ppl={result['metrics']['perplexity']:.2f}"
+                f"ppl={result['metrics']['perplexity'] if result['metrics']['perplexity'] is not None else 'disabled'}"
             )
 
         baseline = {
@@ -515,7 +515,20 @@ class E1Run:
                 ]
                 summary["m1_update_efficacy_final"] = m1_update_efficacy(
                     final_records)
-        # M2: held-out records live in predictions.jsonl (base vs final)
+        # M2: held-out records live in predictions.jsonl (base vs final);
+        # tiny datasets may have no held-out records at all (all subjects
+        # in train) — the summary then reports the gap explicitly instead
+        # of crashing.
+        if not self.predictions_path.exists():
+            summary["m2_heldout_transfer"] = {
+                "heldout_overall": {"n": 0},
+                "note": ("no held-out evaluation records: every subject "
+                         "fell in the train partition for this dataset "
+                         "size; increase the dataset or adjust split "
+                         "fractions"),
+            }
+            summary["sweep_selection"] = self.sweep_selection
+            return summary
         by_state: dict[str, list[dict]] = {}
         for line in self.predictions_path.read_text().splitlines():
             record = json.loads(line)

@@ -749,6 +749,15 @@ def build_wikifactdiff_events(
         "neighborhood", len(neighborhood_candidates),
         lambda i: _materialize_neighborhood(*neighborhood_candidates[i]),
         len(neighborhood_candidates))
+
+    # align sweep_selection keys with the full family names used by
+    # sweep_populations and the pipeline
+    sweep_selection = {
+        ("m1_trained_fact_paraphrases" if k == "m1" else
+         "m3_persistence_probes" if k == "persistence" else
+         "m3_neighborhood_probes"): v
+        for k, v in sweep_selection.items()
+    }
     timer.mark("sweep_materialization",
                objects=sum(len(v) for v in sweep_populations.values()))
 

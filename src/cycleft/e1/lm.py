@@ -586,6 +586,17 @@ def eval_set_loss(
     }
 
 
+def perplexity_enabled(eval_rows: Sequence[dict]) -> bool:
+    """False when the dataset disables perplexity for this evaluation.
+
+    WikiFactDiff rows set ``perplexity_disabled=True``: a defensible
+    multi-reference likelihood is not implemented, and empty or obsolete
+    completions must never enter the loss.  TemporalWiki rows do not set
+    the flag, so TemporalWiki perplexity is unchanged.
+    """
+    return not any(row.get("perplexity_disabled") for row in eval_rows)
+
+
 @torch.no_grad()
 def evaluate_event(
     model,
@@ -599,7 +610,13 @@ def evaluate_event(
     Returns per-event metrics plus per-example prediction records for
     later inspection.
     """
-    from cycleft.e1.metrics import exact_match, exact_match_multi, token_f1, token_f1_multi
+    from cycleft.e1.metrics import (
+        exact_match,
+        exact_match_multi,
+        normalize_answer,
+        token_f1,
+        token_f1_multi,
+    )
 
     emit = log or (lambda message: None)
     started = time.perf_counter()
@@ -634,6 +651,7 @@ def evaluate_event(
                 "reference": reference,
                 "raw_prediction": raw,
                 "prediction": prediction,
+                "prediction_normalized": normalize_answer(prediction),
                 "exact_match": em,
                 "token_f1": f1,
                 **(
@@ -643,10 +661,30 @@ def evaluate_event(
                 ),
             }
         )
+        # WikiFactDiff adapter provenance rides on the row dictionaries;
+        # propagate it so prediction records stay auditable per fact.
+        for meta_key in (
+            "fact_key", "eval_family", "prompt_kind", "partition",
+            "event_tag", "new_answers", "static_answers",
+            "obsolete_answers", "decision_set", "source_row_index",
+        ):
+            if meta_key in row and meta_key not in records[-1]:
+                records[-1][meta_key] = row[meta_key]
         if (index + 1) % 10 == 0:
             emit(f"  evaluated {index + 1}/{len(eval_rows)}")
 
-    loss_stats = eval_set_loss(model, tokenizer, eval_rows, config, log=emit)
+    if perplexity_enabled(eval_rows):
+        loss_stats = eval_set_loss(model, tokenizer, eval_rows, config, log=emit)
+    else:
+        loss_stats = {
+            "eval_loss": None,
+            "perplexity": None,
+            "perplexity_note": (
+                "disabled: WikiFactDiff multi-reference likelihood is not "
+                "implemented; empty/obsolete completions never enter the "
+                "loss (TemporalWiki perplexity is unchanged)"
+            ),
+        }
 
     if was_training:
         model.train()

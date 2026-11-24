@@ -25,7 +25,14 @@ SLICE_COLUMN = "slice_tag"
 
 @dataclass(frozen=True)
 class PreparedEvent:
-    """One temporal event with its (deterministic) training subset and full eval set."""
+    """One event with its (deterministic) training subset and eval sets.
+
+    ``validation_rows`` is an optional, strictly separate model-selection
+    population (added for the WikiFactDiff migration).  It defaults to an
+    empty list, so every existing constructor — TemporalWiki and the
+    E2–E7 consumers — keeps working unchanged.  ``eval_rows`` remain the
+    held-out TEST population; validation is never mixed into them.
+    """
 
     event_id: int
     name: str
@@ -35,6 +42,8 @@ class PreparedEvent:
     train_pool_size: int
     eval_pool_size: int
     train_indices_used: list[int]
+    validation_rows: list[dict] = field(default_factory=list, repr=False)
+    validation_pool_size: int = 0
 
 
 def _dataset_fingerprint(dataset) -> str:
@@ -131,6 +140,7 @@ def prepare_event_datasets(
     seed: int = 42,
     dataset: str = DATASET_TEMPORALWIKI,
     dataset_config: dict[str, Any] | None = None,
+    mode: str | None = None,
 ) -> tuple[list[PreparedEvent], dict[str, Any]]:
     """Prepare all continual-learning events plus a serializable manifest.
 
@@ -147,6 +157,8 @@ def prepare_event_datasets(
         eval_limit: Reserved for debugging; must stay ``None`` in real
             runs. The evaluation set is never reduced to inflate scores.
         seed: Seed controlling the deterministic training subset.
+        mode: 'pilot' or 'full' — derives the evaluation population when
+            the adapter config does not pin one explicitly.
         dataset: Registered dataset adapter name.
         dataset_config: Adapter-specific options (pilot eval populations,
             split fractions, subset name, ...).
@@ -163,6 +175,7 @@ def prepare_event_datasets(
         return prepare_wikifactdiff_events(
             train_limit=train_limit,
             seed=seed,
+            mode=mode,
             dataset_config=dataset_config or {},
         )
     if dataset != DATASET_TEMPORALWIKI:

@@ -19,10 +19,20 @@ stream:
       # relation-aware stratification, salt below)
       salt: "cycleft-wfd-v1"
       split_fractions: [0.80, 0.90]
-      # eval_population: "pilot" (deterministic stratified sample) or
-      # "full" (complete held-out populations; HPC runs)
-      eval_population: "pilot"
+      # eval_population is DERIVED FROM THE MODE when unset:
+      #   pilot mode -> pilot populations (100 sampled test/val per event)
+      #   full  mode -> complete held-out test AND validation populations
+      # Pinning eval_population explicitly overrides the mode; pinning
+      # 'pilot' in full mode is rejected (never a silent downgrade).
+      # eval_population: "pilot"
       pilot_eval_per_event: 100
+      # deterministic sweep populations evaluated at baseline and after
+      # every event (M1 trained-fact paraphrases; M3 persistence +
+      # neighborhood probes)
+      sweep_limits:
+        m1: 200
+        persistence: 200
+        neighborhood: 2000
 
   type: semantic_update
 
@@ -70,7 +80,8 @@ e1:
     pilot:
       train_examples_per_event: 64
     full:
-      train_examples_per_event: null
+      # EXPLICIT 500 (never interpret null as 500)
+      train_examples_per_event: 500
 
   training:
     learning_rate: 2.0e-5

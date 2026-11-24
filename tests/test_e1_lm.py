@@ -39,15 +39,20 @@ def tiny_llama() -> LlamaForCausalLM:
     return LlamaForCausalLM(config)
 
 
-def test_resolve_device_prefers_mps_without_silent_cpu_fallback():
-    if torch.backends.mps.is_available():
+def test_resolve_device_auto_and_explicit_devices():
+    """Policy updated 2026-11-23 (HPC readiness Phase 1): auto = CUDA >
+    MPS > CPU (CPU is the documented last resort of the AUTOMATIC path
+    only); explicitly requested accelerators still fail hard when
+    unavailable, and unsupported strings are still rejected."""
+    if torch.cuda.is_available():
+        assert resolve_device(None).type == "cuda"
+    elif torch.backends.mps.is_available():
         assert resolve_device(None).type == "mps"
-        assert resolve_device("mps").type == "mps"
+    else:
+        assert resolve_device(None).type == "cpu"
     assert resolve_device("cpu").type == "cpu"
     with pytest.raises(ValueError, match="Unsupported device"):
-        resolve_device("auto")
-    with pytest.raises(ValueError, match="Unsupported device"):
-        resolve_device("cuda:0")
+        resolve_device("tpu")
 
 
 def test_lm_runtime_config_roundtrip():

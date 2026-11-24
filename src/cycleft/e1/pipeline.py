@@ -14,6 +14,7 @@ under ``checkpoints/e1/<run_id>/event_<t>/``.
 
 from __future__ import annotations
 
+import collections
 import json
 import platform
 import subprocess
@@ -200,6 +201,10 @@ class E1Run:
         self.device = resolve_device(lm_config.device)
         self.predictions_path = self.results_dir / "predictions.jsonl"
         self.training_log_path = self.results_dir / "training_log.jsonl"
+        self.sweep_populations: dict[str, list[dict]] = {}
+        self.sweep_selection: dict[str, dict] = {}
+        self.sweep_metrics: dict[str, dict[str, dict]] = {}
+        self.validation_metrics: dict[str, dict] = {}
 
     def log(self, message: str) -> None:
         print(f"[e1:{self.run_id}] {message}", flush=True)
@@ -221,6 +226,7 @@ class E1Run:
             seed=self.lm_config.seed,
             dataset=dataset_name,
             dataset_config=dataset_config,
+            mode=self.resolved_config.get("mode"),
         )
         for event in events:
             self.log(
@@ -231,6 +237,8 @@ class E1Run:
         manifest["device"] = str(self.device)
         manifest["precision"] = self.lm_config.dtype
         write_json(self.results_dir / "dataset_manifest.json", manifest)
+        self.sweep_populations = manifest.get("sweep_populations") or {}
+        self.sweep_selection = manifest.get("sweep_selection") or {}
         return events, manifest
 
     def write_config(self) -> None:
@@ -291,6 +299,11 @@ class E1Run:
             "memory_after": memory_status(),
         }
         write_json(self.results_dir / "baseline_metrics.json", baseline)
+        if any(e.validation_rows for e in events):
+            self._evaluate_validation(
+                model, tokenizer, events, state="base", state_index=0)
+        if self.sweep_populations:
+            self._evaluate_sweeps(model, tokenizer, state="base", state_index=0)
         self._release(model, tokenizer)
         return baseline
 
@@ -367,6 +380,7 @@ class E1Run:
                 event.event_id,
                 eval_event.event_id,
                 result["records"],
+                checkpoint_dir=event_dir,
             )
             self.log(
                 f"    test {eval_event.event_id}: "
@@ -374,6 +388,17 @@ class E1Run:
                 f"F1={result['metrics']['token_f1']:.3f}"
             )
 
+        if any(e.validation_rows for e in all_events):
+            self._evaluate_validation(
+                model, tokenizer, all_events,
+                state=f"after_event_{event.event_id}",
+                state_index=event.event_id)
+        if self.sweep_populations:
+            self._evaluate_sweeps(
+                model, tokenizer,
+                state=f"after_event_{event.event_id}",
+                state_index=event.event_id,
+                checkpoint_dir=event_dir)
         self._release(model, tokenizer)
 
         entry = {
@@ -394,12 +419,159 @@ class E1Run:
         )
         return entry
 
+    def _evaluate_validation(
+        self,
+        model,
+        tokenizer,
+        events: list[PreparedEvent],
+        state: str,
+        state_index: int,
+    ) -> None:
+        """Evaluate the strictly separate validation population.
+
+        Validation metrics are written to their own file so
+        hyperparameter selection can never read final-test metrics.
+        """
+        per_event: dict[str, dict] = {}
+        for event in events:
+            if not event.validation_rows:
+                continue
+            result = evaluate_event(
+                model, tokenizer, event.validation_rows, self.lm_config,
+                log=self.log)
+            per_event[str(event.event_id)] = result["metrics"]
+            self._write_predictions(
+                state, state_index, event.event_id, result["records"],
+                population="validation")
+        self.validation_metrics[state] = per_event
+        write_json(self.results_dir / "validation_metrics.json",
+                   self.validation_metrics)
+        self.log(f"  validation evaluated ({state})")
+
+    def _evaluate_sweeps(
+        self,
+        model,
+        tokenizer,
+        state: str,
+        state_index: int,
+        checkpoint_dir: Path | None = None,
+    ) -> None:
+        """Evaluate the deterministic M1/M3 sweep populations.
+
+        Populations are fixed by the dataset adapter (sizes, sample
+        method, seed and exclusions recorded in the dataset manifest).
+        Records keep full provenance (fact key, eval family, prompt
+        kind, partition).  Perplexity is disabled by the adapter rows.
+        """
+        from cycleft.e1.wfd_metrics import answer_rates
+        for family, rows in sorted(self.sweep_populations.items()):
+            if not rows:
+                continue
+            result = evaluate_event(
+                model, tokenizer, rows, self.lm_config, log=self.log)
+            rates = answer_rates(result["records"])
+            entry = {
+                "state": state,
+                "state_index": state_index,
+                "checkpoint_dir": str(checkpoint_dir) if checkpoint_dir else None,
+                "population_size": len(rows),
+                "sample_method": self.sweep_selection.get(family, {}).get(
+                    "method", "full"),
+                "sample_seed": self.sweep_selection.get(family, {}).get("seed"),
+                "standard_metrics": result["metrics"],
+                "answer_rates": rates,
+            }
+            self.sweep_metrics.setdefault(family, {})[state] = entry
+            for record in result["records"]:
+                append_jsonl(
+                    self.results_dir / f"sweep_predictions_{family}.jsonl",
+                    {"state": state, "state_index": state_index, **record})
+            write_json(self.results_dir / f"sweep_metrics_{family}.json",
+                       self.sweep_metrics[family])
+        self.log(f"  sweep populations evaluated ({state})")
+
+    def build_wfd_summary(self, events: list[PreparedEvent]) -> dict | None:
+        """Combined M1/M2/M3 summary from the per-state artifacts."""
+        if not self.sweep_populations:
+            return None
+        from cycleft.e1.wfd_metrics import (
+            m1_update_efficacy,
+            m2_heldout_transfer,
+            m3_neighborhood_retention,
+            m3_persistence_rate,
+        )
+        summary: dict[str, Any] = {"families": {}}
+        for family, states in self.sweep_metrics.items():
+            summary["families"][family] = states
+        if "m1_trained_fact_paraphrases" in self.sweep_populations:
+            final_state = sorted(self.sweep_metrics.get(
+                "m1_trained_fact_paraphrases", {}))
+            if final_state:
+                final_records = [
+                    json.loads(line) for line in (
+                        self.results_dir
+                        / "sweep_predictions_m1_trained_fact_paraphrases.jsonl"
+                    ).read_text().splitlines() if line.strip()
+                ]
+                summary["m1_update_efficacy_final"] = m1_update_efficacy(
+                    final_records)
+        # M2: held-out records live in predictions.jsonl (base vs final)
+        by_state: dict[str, list[dict]] = {}
+        for line in self.predictions_path.read_text().splitlines():
+            record = json.loads(line)
+            if record.get("eval_family") in ("heldout_update",
+                                             "heldout_paraphrase"):
+                by_state.setdefault(record["state"], []).append(record)
+        base_records = by_state.get("base", [])
+        final_state = max(
+            (s for s in by_state if s.startswith("after_event_")),
+            key=lambda s: int(s.rsplit("_", 1)[-1]), default=None)
+        summary["m2_heldout_transfer"] = m2_heldout_transfer(
+            by_state.get(final_state, []) if final_state else [],
+            base_records or None)
+        # M3
+        if "m3_neighborhood_probes" in self.sweep_populations:
+            base_records_n = [
+                json.loads(line) for line in (
+                    self.results_dir
+                    / "sweep_predictions_m3_neighborhood_probes.jsonl"
+                ).read_text().splitlines() if line.strip()
+                and json.loads(line)["state"] == "base"]
+            later = []
+            for line in (
+                self.results_dir
+                / "sweep_predictions_m3_neighborhood_probes.jsonl"
+            ).read_text().splitlines():
+                record = json.loads(line)
+                if record["state"].startswith("after_event_"):
+                    later.append(record)
+            later_by_state = collections.defaultdict(list)
+            for record in later:
+                later_by_state[record["state"]].append(record)
+            summary["m3_neighborhood_retention"] = m3_neighborhood_retention(
+                base_records_n,
+                *[later_by_state[k] for k in sorted(later_by_state)])
+        if "m3_persistence_probes" in self.sweep_populations:
+            final_records_p = []
+            for line in (
+                self.results_dir
+                / "sweep_predictions_m3_persistence_probes.jsonl"
+            ).read_text().splitlines():
+                record = json.loads(line)
+                if record["state"].startswith("after_event_"):
+                    final_records_p.append(record)
+            summary["m3_persistence"] = m3_persistence_rate(final_records_p)
+        summary["sweep_selection"] = self.sweep_selection
+        return summary
+
     def _write_predictions(
         self,
         state: str,
         state_index: int,
         test_event: int,
         records: list[dict],
+        population: str = "test",
+        checkpoint_dir: Path | None = None,
     ) -> None:
         for record in records:
             append_jsonl(
@@ -408,6 +580,11 @@ class E1Run:
                     "state": state,
                     "state_index": state_index,
                     "test_event": test_event,
+                    "population": population,
+                    **(
+                        {"checkpoint_dir": str(checkpoint_dir)}
+                        if checkpoint_dir else {}
+                    ),
                     **record,
                 },
             )
@@ -533,6 +710,10 @@ def run_e1(
     event_metrics = runner.build_event_metrics()
     write_json(runner.results_dir / "event_metrics.json", event_metrics)
     runner.log(f"Wrote {runner.results_dir / 'event_metrics.json'}")
+    wfd_summary = runner.build_wfd_summary(events)
+    if wfd_summary is not None:
+        write_json(runner.results_dir / "wfd_summary.json", wfd_summary)
+        runner.log("Wrote wfd_summary.json (M1/M2/M3)")
     return event_metrics
 
 

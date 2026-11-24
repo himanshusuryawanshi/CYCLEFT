@@ -14,9 +14,6 @@ full dataset to be mutually exclusive and to cover 100% of rows):
                            is_replace == false``                   (161,958)
 * ``wfd_e3_replacement``: ``is_replace == true``                   (32,873)
 
-A brand-new subject can never be a replacement ((ph_new, replace) =
-(1,1) occurs 0 times), so the three events are a true partition.
-
 Partitioning (``wfd-partition-v1``, subject-disjoint 80/10/10 with
 relation-aware stratification):
 
@@ -30,40 +27,41 @@ relation-aware stratification):
    (deterministic across processes — never Python's salted ``hash``) and
    assigned to train/val/test by cumulative fraction (0.8 / 0.9).
 
-Answer semantics:
+Strict train/val/test separation:
 
-* Training targets are ``new``-decision object labels only (one example
-  per valid new object, deterministic object order, exact duplicate
-  (prompt, answer) pairs removed).
-* ``static`` objects remain valid at T_new: they count as valid
-  evaluation answers but are never training targets.
-* ``obsolete`` objects are measurement-only (old-answer rate /
-  suppression); they are never training targets.
-* Obsolete-only rows (no valid post-update answer) are excluded from QA
-  training and retained as **persistence probes**.
-* Rows whose normalized new and obsolete labels overlap are degenerate
-  (2 in the full dataset) and are excluded from training.
-* ``subject_popularity`` is constant per subject and is NEVER used to
-  rank candidate objects within a row.
+* Training, validation and final-test rows are built from their own
+  partitions only; a fact's partition decides everything.
+* Training prompts (update or generalization) never appear in
+  validation or test (masked; exclusions recorded).
+* Validation/test prompt collisions resolve in favour of **test**:
+  colliding prompts are dropped from validation so validation-based
+  model selection cannot expose final-test evaluation.
 
-Leakage protections (see the audits for measured collision counts):
+Answer semantics (fact-local, never a global blacklist):
 
-* Subject disjointness across train/val/test (by construction).
-* Prompt masking: any validation/test prompt string (update or
-  generalization) that also appears among training prompts is dropped
-  from that partition's evaluation prompts; facts that lose all prompts
-  are excluded from evaluation (recorded in the manifest).
-* Validation/test prompt collisions are resolved in favour of **test**
-  (the final test set is never thinned for model-selection convenience).
-* Neighborhood probes: only neighbor facts that belong to **no**
-  partition (not train/val/test rows) and whose prompts do not collide
-  with any partition prompt; deduplicated by fact key.
+* ``new_answers``      : valid at T_new — the only training targets.
+* ``static_answers``   : unchanged inside a changed row — valid at
+  T_new, never trained on.
+* ``obsolete_answers`` : true at T_old only — measurement-only.
+* ``valid_answers``    = new ∪ static (current factual correctness;
+  multi-reference evaluation).
+* Obsolete-only rows carry no valid current answer: they are excluded
+  from ordinary QA training/evaluation and retained as **persistence
+  probes** (``eval_family="persistence_probe"``).
+* Perplexity is **disabled** for this dataset
+  (``perplexity_disabled=True``): a defensible multi-reference
+  likelihood is not implemented, and empty/obsolete completions must
+  never enter the loss.  TemporalWiki perplexity is unchanged.
+
+Sweep populations (M1/M3) are deterministically sampled to configured
+sizes and evaluated at baseline and after every event by the pipeline;
+sizes, method, seed and exclusions are recorded in the manifest.
 """
 
 from __future__ import annotations
 
 import collections
-from typing import Any
+from typing import Any, Callable
 
 from cycleft.data.base import stable_hash
 
@@ -84,17 +82,56 @@ EVENT_DEFINITIONS = {
 QUESTION_COLUMN = "question"
 ANSWER_COLUMN = "object"
 
+LABEL_NORMALIZATION_VERSION = "wfd-strip-plus-v1"
+ANSWER_MATCH_NORMALIZATION_VERSION = "e1-normalize-answer-v1"
+
+DEFAULT_SWEEP_LIMITS = {"m1": 200, "persistence": 200, "neighborhood": 2000}
+FULL_SWEEP_LIMITS = {"m1": 2000, "persistence": 2000, "neighborhood": 5000}
+SWEEP_FAMILIES = ("m1", "persistence", "neighborhood")
+
 
 def normalize_wfd_label(label: str) -> str:
-    """Frozen target normalization for WikiFactDiff object labels.
+    """Frozen target normalization (v1): strip ``+`` prefix and whitespace.
 
-    Wikidata date/quantity labels carry a leading ``+`` sign
-    (``+2022-11-30``); strip it and surrounding whitespace.  Case is
-    preserved in training completions; evaluation matching applies the
-    existing ``cycleft.e1.metrics.normalize_answer`` on both sides.
+    Case is preserved in training completions; evaluation matching applies
+    the existing ``cycleft.e1.metrics.normalize_answer`` on both sides.
     """
     text = str(label).strip()
     return text[1:] if text.startswith("+") else text
+
+
+def validate_adapter_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Fail clearly on invalid adapter configuration values."""
+    if not isinstance(config, dict):
+        raise ValueError("WikiFactDiff adapter config must be a mapping.")
+    eval_population = config.get("eval_population")
+    if eval_population is not None and eval_population not in ("pilot", "full"):
+        raise ValueError(
+            f"eval_population must be 'pilot' or 'full', got {eval_population!r}"
+        )
+    fractions = tuple(config.get("split_fractions", SPLIT_FRACTIONS))
+    if len(fractions) != 2 or not all(0 < f < 1 for f in fractions) \
+            or fractions[0] >= fractions[1]:
+        raise ValueError(
+            f"split_fractions must be two ascending cuts in (0,1), got {fractions!r}"
+        )
+    pilot_eval = int(config.get("pilot_eval_per_event", 100))
+    if pilot_eval <= 0:
+        raise ValueError(
+            f"pilot_eval_per_event must be positive, got {pilot_eval}"
+        )
+    salt = str(config.get("salt", PARTITION_SALT))
+    if not salt:
+        raise ValueError("salt must be a non-empty string.")
+    sweep_limits = config.get("sweep_limits") or {}
+    if not isinstance(sweep_limits, dict):
+        raise ValueError("sweep_limits must be a mapping.")
+    for family, limit in sweep_limits.items():
+        if family not in SWEEP_FAMILIES:
+            raise ValueError(f"Unknown sweep family {family!r}")
+        if int(limit) <= 0:
+            raise ValueError(f"sweep limit for {family} must be positive")
+    return config
 
 
 def _event_tag(row: dict) -> str:
@@ -103,6 +140,22 @@ def _event_tag(row: dict) -> str:
     if bool(row["is_replace"]):
         return "wfd_e3_replacement"
     return "wfd_e2_other_update"
+
+
+def _answer_sets(row: dict) -> tuple[set[str], set[str], set[str]]:
+    """Normalized (new, static, obsolete) label sets of one row."""
+    new_labels: set[str] = set()
+    static_labels: set[str] = set()
+    obsolete_labels: set[str] = set()
+    for o in row["objects"]:
+        label = normalize_wfd_label(o["label"])
+        if o["decision"] == "new":
+            new_labels.add(label)
+        elif o["decision"] == "static":
+            static_labels.add(label)
+        elif o["decision"] == "obsolete":
+            obsolete_labels.add(label)
+    return new_labels, static_labels, obsolete_labels
 
 
 def assign_partitions(
@@ -145,64 +198,55 @@ def assign_partitions(
     return assignment
 
 
-def _row_fact_key(row: dict) -> tuple[str, str]:
+def _fact_key(row: dict) -> tuple[str, str]:
     return (row["subject"]["id"], row["relation"]["id"])
 
 
-def _make_training_example(
-    row: dict, answer: str, partition: str
+def _build_example(
+    row: dict,
+    *,
+    question: str,
+    primary_answer: str,
+    source_row_index: int | None,
+    partition: str,
+    event_tag: str,
+    eval_family: str | None = None,
+    prompt_kind: str | None = None,
+    perplexity_disabled: bool = False,
+    object_index: int | None = None,
 ) -> dict:
-    new_answers = sorted(
-        {
-            normalize_wfd_label(o["label"])
-            for o in row["objects"]
-            if o["decision"] == "new"
-        }
-    )
-    obsolete_answers = sorted(
-        {
-            normalize_wfd_label(o["label"])
-            for o in row["objects"]
-            if o["decision"] == "obsolete"
-        }
-    )
-    static_answers = sorted(
-        {
-            normalize_wfd_label(o["label"])
-            for o in row["objects"]
-            if o["decision"] == "static"
-        }
-    )
-    return {
-        "question": row["update_prompt"],
-        "object": answer,
-        "valid_answers": list(new_answers),
-        "obsolete_answers": obsolete_answers,
+    """One schema-complete example with full fact-local answer metadata."""
+    new_answers = sorted(_answer_sets(row)[0])
+    static_answers = sorted(_answer_sets(row)[1])
+    obsolete_answers = sorted(_answer_sets(row)[2])
+    valid_answers = sorted(set(new_answers) | set(static_answers))
+    example: dict[str, Any] = {
+        "question": question,
+        "object": primary_answer,
+        "new_answers": new_answers,
         "static_answers": static_answers,
+        "obsolete_answers": obsolete_answers,
+        "valid_answers": valid_answers,
+        "decision_set": sorted({o["decision"] for o in row["objects"]}),
         "fact_key": f"{row['subject']['id']}|{row['relation']['id']}",
         "subject_id": row["subject"]["id"],
         "relation_id": row["relation"]["id"],
         "partition": partition,
-        "event_tag": _event_tag(row),
+        "event_tag": event_tag,
         "subject_is_ph_new": bool(row["subject_is_ph_new"]),
         "is_replace": bool(row["is_replace"]),
         "subject_popularity": float(row["subject_popularity"]),
         "gen_prompts": list(row["generalization_prompts"]),
-        "source_row_type": "update",
+        "perplexity_disabled": perplexity_disabled,
     }
-
-
-def _make_eval_row(
-    row: dict,
-    prompt: str,
-    prompt_kind: str,
-    eval_family: str,
-    partition: str,
-) -> dict:
-    example = _make_training_example(row, "", partition)
-    example["question"] = prompt
-    example["prompt_kind"] = prompt_kind
-    example["eval_family"] = eval_family
+    if eval_family is not None:
+        example["eval_family"] = eval_family
+    if prompt_kind is not None:
+        example["prompt_kind"] = prompt_kind
+    if source_row_index is not None:
+        example["source_row_index"] = source_row_index
+    if object_index is not None:
+        example["object_index"] = object_index
     return example
 
 
@@ -211,17 +255,42 @@ def build_wikifactdiff_events(
     *,
     seed: int,
     train_limit: int | None = None,
-    eval_population: str = "full",
-    pilot_eval_per_event: int = 100,
-    salt: str = PARTITION_SALT,
-    fractions: tuple[float, ...] = SPLIT_FRACTIONS,
+    mode: str | None = None,
+    adapter_config: dict[str, Any] | None = None,
 ) -> tuple[list, dict]:
     """Pure event-construction core (no HF access) — unit-testable.
 
     Takes materialized WikiFactDiff rows (schema of the
     ``20210104-20230227_legacy`` config) and returns
-    ``(list[PreparedEvent], manifest)``.
+    ``(list[PreparedEvent], manifest)``.  ``mode`` ("pilot"/"full")
+    determines the default evaluation population when the adapter config
+    does not pin one explicitly; requesting ``pilot`` populations in
+    ``full`` mode is a configuration error (never a silent downgrade).
     """
+    config = validate_adapter_config(dict(adapter_config or {}))
+    fractions = tuple(config.get("split_fractions", SPLIT_FRACTIONS))
+    salt = str(config.get("salt", PARTITION_SALT))
+    configured_population = config.get("eval_population")
+    if configured_population is None:
+        if mode not in ("pilot", "full"):
+            raise ValueError(
+                "eval_population is not pinned in the adapter config and "
+                f"mode={mode!r} cannot derive it (expected 'pilot' or 'full')."
+            )
+        eval_population = mode
+    else:
+        if mode == "full" and configured_population == "pilot":
+            raise ValueError(
+                "Refusing to evaluate the FULL experiment with PILOT "
+                "evaluation populations (would silently weaken the run). "
+                "Set eval_population='full' for full mode."
+            )
+        eval_population = configured_population
+    pilot_eval_per_event = int(config.get("pilot_eval_per_event", 100))
+    sweep_limits = {
+        **(FULL_SWEEP_LIMITS if eval_population == "full" else DEFAULT_SWEEP_LIMITS),
+        **(config.get("sweep_limits") or {}),
+    }
     if train_limit is not None and train_limit <= 0:
         raise ValueError(f"train_limit must be positive or None, got {train_limit!r}")
 
@@ -231,281 +300,216 @@ def build_wikifactdiff_events(
         assignment[row["subject"]["id"]] for row in rows
     )
 
-    # ---- per-fact answer analysis and exclusions --------------------------
-    excluded: list[dict[str, Any]] = []
-    degenerate_fact_keys = set()
-    obsolete_only_fact_keys = set()
-    decision_counts_total = collections.Counter()
-    for row in rows:
+    # ---- per-fact classification and exclusions ---------------------------
+    degenerate: list[dict] = []
+    persistence_fact_keys: set[tuple[str, str]] = set()
+    decision_counts_total: collections.Counter = collections.Counter()
+    for row_index, row in enumerate(rows):
         for o in row["objects"]:
             decision_counts_total[o["decision"]] += 1
-        new_labels = {
-            normalize_wfd_label(o["label"])
-            for o in row["objects"]
-            if o["decision"] == "new"
-        }
-        obsolete_labels = {
-            normalize_wfd_label(o["label"])
-            for o in row["objects"]
-            if o["decision"] == "obsolete"
-        }
-        fk = _row_fact_key(row)
+        new_labels, _, obsolete_labels = _answer_sets(row)
+        fk = _fact_key(row)
         if new_labels & obsolete_labels:
-            degenerate_fact_keys.add(fk)
-            excluded.append(
+            degenerate.append(
                 {
                     "fact_key": f"{fk[0]}|{fk[1]}",
                     "reason": "degenerate_new_obsolete_overlap",
                     "partition": assignment[row["subject"]["id"]],
+                    "source_row_index": row_index,
                 }
             )
         elif not new_labels and obsolete_labels:
-            obsolete_only_fact_keys.add(fk)
-            excluded.append(
-                {
-                    "fact_key": f"{fk[0]}|{fk[1]}",
-                    "reason": "obsolete_only_persistence_probe",
-                    "partition": assignment[row["subject"]["id"]],
-                }
-            )
+            persistence_fact_keys.add(fk)
+    degenerate_keys = {tuple(e["fact_key"].split("|", 1)) for e in degenerate}
+    partition_fact_keys = {_fact_key(r) for r in rows}
+    # NOTE: obsolete-only rows are NOT excluded from the dataset — they are
+    # reclassified as persistence probes (no deletion-training mechanism).
 
-    # ---- training examples (train partition only) -------------------------
-    event_train_pool: dict[str, list[dict]] = {tag: [] for tag in EVENT_TAGS}
-    expanded_count = 0
-    for row in rows:
-        fk = _row_fact_key(row)
-        if fk in degenerate_fact_keys or fk in obsolete_only_fact_keys:
-            continue
-        if assignment[row["subject"]["id"]] != "train":
-            continue
-        new_objects = sorted(
-            (
-                normalize_wfd_label(o["label"]),
-                o["id"] is None,
-                o["id"] or "",
-            )
-            for o in row["objects"]
-            if o["decision"] == "new"
-        )
-        for answer, _, _ in new_objects:
-            expanded_count += 1
-            event_train_pool[_event_tag(row)].append(
-                _make_training_example(row, answer, "train")
-            )
+    # ---- strict train / val / test fact assignment ------------------------
+    train_pool_by_event: dict[str, list[dict]] = {tag: [] for tag in EVENT_TAGS}
+    raw_val_rows: dict[str, list[tuple[int, dict]]] = {
+        tag: [] for tag in EVENT_TAGS
+    }
+    raw_test_rows: dict[str, list[tuple[int, dict]]] = {
+        tag: [] for tag in EVENT_TAGS
+    }
+    expanded_total = 0
+    for row_index, row in enumerate(rows):
+        fk = _fact_key(row)
+        partition = assignment[row["subject"]["id"]]
+        tag = _event_tag(row)
+        new_labels, _, _ = _answer_sets(row)
+        if partition == "train":
+            if fk in persistence_fact_keys or fk in degenerate_keys:
+                continue  # persistence probes / degenerate rows never train
+            ordered_new = sorted(new_labels)  # deterministic object order
+            for object_index, answer in enumerate(ordered_new):
+                example = _build_example(
+                    row,
+                    question=row["update_prompt"],
+                    primary_answer=answer,
+                    source_row_index=row_index,
+                    partition="train",
+                    event_tag=tag,
+                    perplexity_disabled=True,
+                    object_index=object_index,
+                )
+                example["expanded_index"] = expanded_total
+                expanded_total += 1
+                train_pool_by_event[tag].append(example)
+        elif partition == "val":
+            raw_val_rows[tag].append((row_index, row))
+        else:
+            raw_test_rows[tag].append((row_index, row))
 
-    # deduplicate exact (question, object) pairs, preserving order
-    event_train_rows: dict[str, list[dict]] = {}
+    # deduplicate exact (question, object) pairs within each event pool
+    event_train_expanded: dict[str, list[dict]] = {}
     dedup_removed = 0
-    for tag, pool in event_train_pool.items():
-        seen = set()
-        kept = []
-        for example in pool:
-            key = (example["question"], example["object"])
-            if key in seen:
+    for tag in EVENT_TAGS:
+        seen: set[tuple[str, str]] = set()
+        kept: list[dict] = []
+        for example in train_pool_by_event[tag]:
+            pair = (example["question"], example["object"])
+            if pair in seen:
                 dedup_removed += 1
                 continue
-            seen.add(key)
+            seen.add(pair)
             kept.append(example)
-        if train_limit is not None and len(kept) > train_limit:
-            from cycleft.e1.data import deterministic_subset
+        event_train_expanded[tag] = kept
 
-            kept, _indices = deterministic_subset(kept, train_limit, seed)
-        event_train_rows[tag] = kept
-
-    # ---- evaluation populations -------------------------------------------
-    # M2: held-out facts (val/test partitions).  Prompt masking removes any
-    # val/test prompt that also appears among TRAIN-PARTITION prompts
-    # (update or generalization of ANY train fact — not just the sampled
-    # training examples, so the mask is stable across pilot/full sizes);
-    # val/test collisions resolve in favour of test.
+    # ---- prompt masks (train first; val protects final test) --------------
     train_prompts: set[str] = set()
-    for row in rows:
+    train_gen_prompts: set[str] = set()
+    for tag in EVENT_TAGS:
+        for example in event_train_expanded[tag]:
+            train_prompts.add(example["question"])
+        for row_index, row in raw_val_rows[tag]:
+            pass
+    for row_index, row in enumerate(rows):
+        fk = _fact_key(row)
         if assignment[row["subject"]["id"]] != "train":
             continue
-        train_prompts.add(row["update_prompt"])
-        train_prompts.update(row["generalization_prompts"])
+        if fk in persistence_fact_keys or fk in degenerate_keys:
+            continue
+        train_gen_prompts.update(row["generalization_prompts"])
+    train_all_prompts = train_prompts | train_gen_prompts
 
-    def _masked_prompts(prompts: list[str], other_partition_prompts: set[str]):
+    def _masked(prompts, blocked, reason, fk, partition):
         kept, dropped = [], []
         for prompt in prompts:
-            if prompt in train_prompts:
-                dropped.append((prompt, "train_prompt_collision"))
-            elif prompt in other_partition_prompts:
-                dropped.append((prompt, "val_test_prompt_collision"))
+            if prompt in blocked:
+                dropped.append(
+                    {"fact_key": f"{fk[0]}|{fk[1]}", "partition": partition,
+                     "reason": reason, "prompt": prompt}
+                )
             else:
                 kept.append(prompt)
         return kept, dropped
 
-    val_upd_prompts = {
-        row["update_prompt"] for row in rows if assignment[row["subject"]["id"]] == "val"
-    }
-    mask_exclusions: list[dict[str, Any]] = []
-    eval_facts_dropped_no_prompts = 0
-    event_eval_rows: dict[str, list[dict]] = {tag: [] for tag in EVENT_TAGS}
-    event_eval_counts: dict[str, dict] = {}
-
-    if eval_population not in ("full", "pilot"):
-        raise ValueError(f"Unknown eval_population {eval_population!r}")
-
-    # group eval facts per event tag
-    eval_facts_by_event: dict[str, list[dict]] = {tag: [] for tag in EVENT_TAGS}
-    for row in rows:
-        fk = _row_fact_key(row)
-        if fk in degenerate_fact_keys:
-            continue  # degenerate rows are excluded everywhere
-        partition = assignment[row["subject"]["id"]]
-        if partition == "train":
-            continue
-        eval_facts_by_event[_event_tag(row)].append(row)
-
+    # test: masked against train prompts only (final test is protected)
+    final_test_rows: dict[str, list[dict]] = {tag: [] for tag in EVENT_TAGS}
+    final_test_prompts: set[str] = set()
+    mask_exclusions: list[dict] = []
+    test_facts_dropped = 0
     for tag in EVENT_TAGS:
-        kept_rows: list[dict] = []
-        for row in eval_facts_by_event[tag]:
-            partition = assignment[row["subject"]["id"]]
-            other_partition_prompts = val_upd_prompts if partition == "test" else set()
-            upd_kept, upd_dropped = _masked_prompts(
-                [row["update_prompt"]], other_partition_prompts
-            )
-            gen_kept, gen_dropped = _masked_prompts(
-                list(row["generalization_prompts"]), other_partition_prompts
-            )
-            for prompt, reason in upd_dropped + gen_dropped:
-                mask_exclusions.append(
-                    {
-                        "fact_key": f"{row['subject']['id']}|{row['relation']['id']}",
-                        "partition": partition,
-                        "reason": reason,
-                        "prompt": prompt,
-                    }
-                )
+        for row_index, row in raw_test_rows[tag]:
+            fk = _fact_key(row)
+            upd_kept, upd_dropped = _masked(
+                [row["update_prompt"]], train_all_prompts,
+                "train_prompt_collision", fk, "test")
+            gen_kept, gen_dropped = _masked(
+                list(row["generalization_prompts"]), train_all_prompts,
+                "train_prompt_collision", fk, "test")
+            mask_exclusions.extend(upd_dropped + gen_dropped)
             if not upd_kept and not gen_kept:
-                eval_facts_dropped_no_prompts += 1
+                test_facts_dropped += 1
                 mask_exclusions.append(
-                    {
-                        "fact_key": f"{row['subject']['id']}|{row['relation']['id']}",
-                        "partition": partition,
-                        "reason": "all_prompts_masked",
-                    }
-                )
+                    {"fact_key": f"{fk[0]}|{fk[1]}", "partition": "test",
+                     "reason": "all_prompts_masked"})
                 continue
+            new_labels, static_labels, _ = _answer_sets(row)
+            current = sorted(new_labels or static_labels)
             for prompt in upd_kept:
-                kept_rows.append(
-                    _make_eval_row(row, prompt, "update_prompt", "heldout_update", partition)
-                )
+                final_test_prompts.add(prompt)
+                final_test_rows[tag].append(
+                    _build_example(
+                        row, question=prompt,
+                        primary_answer=current[0] if current else "",
+                        source_row_index=row_index, partition="test",
+                        event_tag=tag, eval_family="heldout_update",
+                        prompt_kind="update_prompt", perplexity_disabled=True))
             for prompt in gen_kept:
-                kept_rows.append(
-                    _make_eval_row(
-                        row, prompt, "generalization_prompt", "heldout_paraphrase", partition
-                    )
-                )
+                final_test_prompts.add(prompt)
+                final_test_rows[tag].append(
+                    _build_example(
+                        row, question=prompt,
+                        primary_answer=current[0] if current else "",
+                        source_row_index=row_index, partition="test",
+                        event_tag=tag, eval_family="heldout_paraphrase",
+                        prompt_kind="generalization_prompt",
+                        perplexity_disabled=True))
 
-        # pilot population: deterministic stratified sample
-        if eval_population == "pilot" and len(kept_rows) > pilot_eval_per_event:
-            from cycleft.e1.data import deterministic_subset
-
-            kept_rows, _indices = deterministic_subset(
-                kept_rows, pilot_eval_per_event, seed
-            )
-        event_eval_rows[tag] = kept_rows
-        event_eval_counts[tag] = {
-            "n_eval_rows": len(kept_rows),
-            "n_eval_facts_available": len(eval_facts_by_event[tag]),
-        }
-
-    # ---- M1 population: trained facts' generalization prompts -------------
-    m1_rows: list[dict] = []
+    # val: masked against train AND final-test prompts (test is protected)
+    final_val_rows: dict[str, list[dict]] = {tag: [] for tag in EVENT_TAGS}
+    val_facts_dropped = 0
     for tag in EVENT_TAGS:
-        for example in event_train_rows[tag]:
-            for prompt in example["gen_prompts"]:
-                m1_row = dict(example)
-                m1_row["question"] = prompt
-                m1_row["prompt_kind"] = "generalization_prompt"
-                m1_row["eval_family"] = "trained_fact_paraphrase"
-                m1_rows.append(m1_row)
-            # the trained fact's own update_prompt IS the training example;
-            # M1 evaluates only its held-out paraphrases.
+        for row_index, row in raw_val_rows[tag]:
+            fk = _fact_key(row)
+            blocked = train_all_prompts | final_test_prompts
+            upd_kept, upd_dropped = _masked(
+                [row["update_prompt"]], blocked,
+                "train_or_test_prompt_collision", fk, "val")
+            gen_kept, gen_dropped = _masked(
+                list(row["generalization_prompts"]), blocked,
+                "train_or_test_prompt_collision", fk, "val")
+            mask_exclusions.extend(upd_dropped + gen_dropped)
+            if not upd_kept and not gen_kept:
+                val_facts_dropped += 1
+                mask_exclusions.append(
+                    {"fact_key": f"{fk[0]}|{fk[1]}", "partition": "val",
+                     "reason": "all_prompts_masked"})
+                continue
+            new_labels, static_labels, _ = _answer_sets(row)
+            current = sorted(new_labels or static_labels)
+            for prompt in upd_kept:
+                final_val_rows[tag].append(
+                    _build_example(
+                        row, question=prompt,
+                        primary_answer=current[0] if current else "",
+                        source_row_index=row_index, partition="val",
+                        event_tag=tag, eval_family="validation_update",
+                        prompt_kind="update_prompt", perplexity_disabled=True))
+            for prompt in gen_kept:
+                final_val_rows[tag].append(
+                    _build_example(
+                        row, question=prompt,
+                        primary_answer=current[0] if current else "",
+                        source_row_index=row_index, partition="val",
+                        event_tag=tag, eval_family="validation_paraphrase",
+                        prompt_kind="generalization_prompt",
+                        perplexity_disabled=True))
 
-    # ---- M3 persistence probes (obsolete-only rows) ------------------------
-    persistence_rows: list[dict] = []
-    for row in rows:
-        fk = _row_fact_key(row)
-        if fk in obsolete_only_fact_keys:
-            obsolete_answers = sorted(
-                {
-                    normalize_wfd_label(o["label"])
-                    for o in row["objects"]
-                    if o["decision"] == "obsolete"
-                }
-            )
-            example = _make_training_example(row, "", assignment[row["subject"]["id"]])
-            example["question"] = row["update_prompt"]
-            example["eval_family"] = "persistence_probe"
-            example["obsolete_answers"] = obsolete_answers
-            example["valid_answers"] = []  # nothing valid post-update
-            persistence_rows.append(example)
+    # pilot sampling: independent deterministic samples for test and val
+    if eval_population == "pilot":
+        from cycleft.e1.data import deterministic_subset
+        for tag in EVENT_TAGS:
+            for population in (final_test_rows, final_val_rows):
+                if len(population[tag]) > pilot_eval_per_event:
+                    sampled, _indices = deterministic_subset(
+                        population[tag], pilot_eval_per_event, seed)
+                    population[tag] = sampled
 
-    # ---- M3 neighborhood probes -------------------------------------------
-    partition_fact_keys = {_row_fact_key(row) for row in rows}
-    partition_prompts = train_prompts | val_upd_prompts | {
-        row["update_prompt"] for row in rows if assignment[row["subject"]["id"]] == "test"
-    }
-    seen_probe_keys = set()
-    neighborhood_rows: list[dict] = []
-    neighborhood_excluded = 0
-    for row in rows:
-        rid = row["relation"]["id"]
-        for nb in row["neighborhood"]:
-            probe_key = (nb["subject"]["id"], rid)
-            if probe_key in partition_fact_keys:
-                neighborhood_excluded += 1
-                continue  # belongs to a dataset partition: never a probe
-            probe_id = (probe_key, tuple(o.get("prompt") for o in nb["objects"]))
-            if probe_id in seen_probe_keys:
-                continue  # deduplicate by fact key + prompt set
-            seen_probe_keys.add(probe_id)
-            # NOTE: neighborhood objects are NESTED ({"object": {...}, "prompt":
-            # ...}), unlike the flat row-level objects — an actual schema
-            # finding from the real data, not the HF card's flattened prose.
-            for o in nb["objects"]:
-                prompt = o.get("prompt")
-                entity = o.get("object") or {}
-                label = entity.get("label")
-                if not prompt or not label or prompt in partition_prompts:
-                    neighborhood_excluded += 1
-                    continue
-                answer = normalize_wfd_label(label)
-                neighborhood_rows.append(
-                    {
-                        "question": prompt,
-                        "object": answer,
-                        "valid_answers": [answer],
-                        "obsolete_answers": [],
-                        "static_answers": [answer],
-                        "fact_key": f"{probe_key[0]}|{probe_key[1]}",
-                        "subject_id": probe_key[0],
-                        "relation_id": probe_key[1],
-                        "partition": "probe",
-                        "event_tag": "neighborhood",
-                        "subject_is_ph_new": False,
-                        "is_replace": False,
-                        "subject_popularity": 0.0,
-                        "gen_prompts": [],
-                        "source_row_type": "neighborhood_probe",
-                        "prompt_kind": "neighbor_prompt",
-                        "eval_family": "neighborhood_probe",
-                        "neighbor_of": f"{row['subject']['id']}|{rid}",
-                        "neighbor_distance": float(nb.get("dist", 0.0)),
-                    }
-                )
-
-    # ---- PreparedEvent assembly (import here to avoid cycles) --------------
+    # ---- training selection ----------------------------------------------
     from cycleft.e1.data import PreparedEvent, deterministic_subset
 
     events = []
     manifest_events = []
+    train_provenance = {}
     for event_id, tag in enumerate(EVENT_TAGS, start=1):
-        train_rows = event_train_rows[tag]
-        eval_rows = event_eval_rows[tag]
+        pool = event_train_expanded[tag]
+        train_rows, selected_indices = deterministic_subset(pool, train_limit, seed)
+        eval_rows = final_test_rows[tag]
+        val_rows = final_val_rows[tag]
         events.append(
             PreparedEvent(
                 event_id=event_id,
@@ -513,24 +517,187 @@ def build_wikifactdiff_events(
                 slice_tag=tag,
                 train_rows=train_rows,
                 eval_rows=eval_rows,
-                train_pool_size=len(event_train_pool[tag]),
+                train_pool_size=len(pool),
                 eval_pool_size=len(eval_rows),
-                train_indices_used=list(range(len(train_rows))),
+                train_indices_used=selected_indices,
+                validation_rows=val_rows,
+                validation_pool_size=len(val_rows),
             )
         )
+        train_provenance[tag] = {
+            "n_expanded_pool": len(pool),
+            "selected_expanded_indices": selected_indices,
+            "selected_source_row_indices": sorted(
+                {ex.get("source_row_index") for ex in train_rows}
+            ),
+            "selected_fact_keys": sorted({ex["fact_key"] for ex in train_rows}),
+            "n_train_used": len(train_rows),
+            "n_validation_rows": len(val_rows),
+        }
         manifest_events.append(
             {
                 "event_id": event_id,
                 "name": tag,
                 "event_definition": EVENT_DEFINITIONS[tag],
-                "n_train_pool": len(event_train_pool[tag]),
+                "n_train_pool": len(pool),
                 "n_train_used": len(train_rows),
                 "n_eval_rows": len(eval_rows),
+                "n_validation_rows": len(val_rows),
                 "eval_population": eval_population,
                 "question_column": QUESTION_COLUMN,
                 "answer_column": ANSWER_COLUMN,
             }
         )
+
+    # ---- sweep populations (deterministic, size-capped, two-phase) -------
+    # Phase A collects LIGHTWEIGHT candidate references (no example dicts);
+    # phase B deterministically samples candidate positions and
+    # materializes ONLY the selected entries.  This keeps memory bounded
+    # (the full pools would be ~2.2M example dicts).
+
+    # M1 candidates: (train_example_ref, gen_index) — the example dicts
+    # already exist in event_train_expanded, so candidates are references.
+    m1_candidates: list[tuple[dict, int]] = []
+    for tag in EVENT_TAGS:
+        for example in event_train_expanded[tag]:
+            for gen_index, _prompt in enumerate(example["gen_prompts"]):
+                m1_candidates.append((example, gen_index))
+
+    # persistence candidates: (row_ref, row_index)
+    persistence_candidates: list[tuple[dict, int]] = []
+    for row_index, row in enumerate(rows):
+        if _fact_key(row) in persistence_fact_keys:
+            persistence_candidates.append((row, row_index))
+
+    partition_prompts = set(final_test_prompts) | train_all_prompts
+    for tag in EVENT_TAGS:
+        partition_prompts.update(ex["question"] for ex in final_val_rows[tag])
+        partition_prompts.update(ex["question"] for ex in final_test_rows[tag])
+
+    # neighborhood candidates: (row_ref, neighbor_ref, probe_key) for
+    # candidates passing key-exclusion, key-dedup and prompt/label
+    # viability; occurrences/unique keys/exclusions counted separately.
+    neighborhood_occurrences = 0
+    neighborhood_unique_keys: set[tuple[str, str]] = set()
+    neighborhood_excluded_occurrences = 0
+    neighborhood_candidates: list[tuple[dict, dict, tuple[str, str]]] = []
+    seen_probe_keys: set[tuple[str, str]] = set()
+    for row in rows:
+        rid = row["relation"]["id"]
+        for nb in row["neighborhood"]:
+            probe_key = (nb["subject"]["id"], rid)
+            neighborhood_occurrences += 1
+            neighborhood_unique_keys.add(probe_key)
+            if probe_key in partition_fact_keys:
+                neighborhood_excluded_occurrences += 1
+                continue  # belongs to a dataset partition: never a probe
+            if probe_key in seen_probe_keys:
+                continue  # strict dedup by fact key
+            seen_probe_keys.add(probe_key)
+            viable_prompts = []
+            for o in nb["objects"]:
+                prompt = o.get("prompt")
+                entity = o.get("object") or {}
+                label = entity.get("label")
+                if not prompt or not label:
+                    neighborhood_excluded_occurrences += 1
+                    continue
+                if prompt in partition_prompts:
+                    neighborhood_excluded_occurrences += 1
+                    continue
+                viable_prompts.append((prompt, normalize_wfd_label(label)))
+            if not viable_prompts:
+                neighborhood_excluded_occurrences += 1
+                continue
+            neighborhood_candidates.append((row, nb, probe_key, viable_prompts))
+
+    def _materialize_m1(example: dict, gen_index: int) -> dict:
+        row_dict = dict(example)
+        row_dict["question"] = example["gen_prompts"][gen_index]
+        row_dict["prompt_kind"] = "generalization_prompt"
+        row_dict["eval_family"] = "trained_fact_paraphrase"
+        row_dict["gen_index"] = gen_index
+        row_dict["perplexity_disabled"] = True
+        return row_dict
+
+    def _materialize_persistence(row: dict, row_index: int) -> dict:
+        example = _build_example(
+            row, question=row["update_prompt"], primary_answer="",
+            source_row_index=row_index,
+            partition=assignment[row["subject"]["id"]],
+            event_tag=_event_tag(row), eval_family="persistence_probe",
+            prompt_kind="update_prompt", perplexity_disabled=True)
+        example["valid_answers"] = []
+        example["obsolete_answers"] = sorted(_answer_sets(row)[2])
+        return example
+
+    def _materialize_neighborhood(
+        row: dict, nb: dict, probe_key: tuple[str, str],
+        viable_prompts: list[tuple[str, str]],
+    ) -> list[dict]:
+        rows_out = []
+        for prompt, answer in viable_prompts:
+            rows_out.append(
+                {
+                    "question": prompt,
+                    "object": answer,
+                    "valid_answers": [answer],
+                    "new_answers": [],
+                    "static_answers": [answer],
+                    "obsolete_answers": [],
+                    "decision_set": ["static"],
+                    "fact_key": f"{probe_key[0]}|{probe_key[1]}",
+                    "subject_id": probe_key[0],
+                    "relation_id": probe_key[1],
+                    "partition": "probe",
+                    "event_tag": "neighborhood",
+                    "eval_family": "neighborhood_probe",
+                    "prompt_kind": "neighbor_prompt",
+                    "perplexity_disabled": True,
+                    "neighbor_of": f"{row['subject']['id']}|{row['relation']['id']}",
+                    "neighbor_distance": float(nb.get("dist", 0.0)),
+                }
+            )
+        return rows_out
+
+    sweep_populations: dict[str, list[dict]] = {}
+    sweep_selection: dict[str, dict] = {}
+
+    def _select_and_materialize(
+        family: str, pool_size: int,
+        materialize: Callable[..., list[dict] | dict],
+        candidate_count: int,
+    ) -> list[dict]:
+        limit = min(int(sweep_limits[family]), candidate_count)
+        selected_indices, _ = deterministic_subset(
+            list(range(candidate_count)), limit, seed)
+        selected = []
+        for index in selected_indices:
+            item = materialize(index)
+            if isinstance(item, list):
+                selected.extend(item)
+            else:
+                selected.append(item)
+        sweep_selection[family] = {
+            "pool_size": candidate_count,
+            "selected_size": len(selected),
+            "method": "deterministic_subset(seed) over candidate positions",
+            "seed": seed,
+            "selected_indices": selected_indices,
+        }
+        return selected
+
+    sweep_populations["m1_trained_fact_paraphrases"] = _select_and_materialize(
+        "m1", len(m1_candidates),
+        lambda i: _materialize_m1(*m1_candidates[i]), len(m1_candidates))
+    sweep_populations["m3_persistence_probes"] = _select_and_materialize(
+        "persistence", len(persistence_candidates),
+        lambda i: _materialize_persistence(*persistence_candidates[i]),
+        len(persistence_candidates))
+    sweep_populations["m3_neighborhood_probes"] = _select_and_materialize(
+        "neighborhood", len(neighborhood_candidates),
+        lambda i: _materialize_neighborhood(*neighborhood_candidates[i]),
+        len(neighborhood_candidates))
 
     manifest = {
         "dataset_id": DATASET_ID,
@@ -544,64 +711,71 @@ def build_wikifactdiff_events(
         "train_limit": train_limit,
         "eval_limit": None,
         "eval_population": eval_population,
-        "pilot_eval_per_event": pilot_eval_per_event if eval_population == "pilot" else None,
+        "mode": mode,
+        "pilot_eval_per_event": pilot_eval_per_event
+        if eval_population == "pilot" else None,
         "question_column": QUESTION_COLUMN,
         "answer_column": ANSWER_COLUMN,
+        "label_normalization_version": LABEL_NORMALIZATION_VERSION,
+        "answer_match_normalization_version": ANSWER_MATCH_NORMALIZATION_VERSION,
+        "effective_adapter_config": {
+            "eval_population": eval_population,
+            "pilot_eval_per_event": pilot_eval_per_event
+            if eval_population == "pilot" else None,
+            "salt": salt,
+            "split_fractions": list(fractions),
+            "sweep_limits": sweep_limits,
+        },
         "events": manifest_events,
         "counts": {
             "original_rows": len(rows),
-            "unique_facts": len({_row_fact_key(r) for r in rows}),
-            "expanded_examples": expanded_count,
-            "deduplicated_examples": expanded_count - dedup_removed,
+            "unique_facts": len({_fact_key(r) for r in rows}),
+            "expanded_examples": expanded_total,
+            "deduplicated_examples": expanded_total - dedup_removed,
             "dedup_removed": dedup_removed,
-            "excluded_degenerate_rows": len(degenerate_fact_keys),
-            "obsolete_only_persistence_probes": len(obsolete_only_fact_keys),
+            "excluded_degenerate_rows": len(degenerate),
+            "obsolete_only_persistence_probes": len(persistence_fact_keys),
             "answer_decisions_total": dict(decision_counts_total),
             "partition_subjects": dict(partition_subjects),
             "partition_facts": dict(partition_facts),
             "mask_exclusions": len(mask_exclusions),
-            "eval_facts_dropped_all_prompts_masked": eval_facts_dropped_no_prompts,
-            "neighborhood_probes": len(neighborhood_rows),
-            "neighborhood_excluded_occurrences": neighborhood_excluded,
+            "val_facts_dropped_all_prompts_masked": val_facts_dropped,
+            "test_facts_dropped_all_prompts_masked": test_facts_dropped,
+            "neighborhood_total_occurrences": neighborhood_occurrences,
+            "neighborhood_unique_keys": len(neighborhood_unique_keys),
+            "neighborhood_excluded_occurrences": neighborhood_excluded_occurrences,
+            "neighborhood_probes": len(sweep_populations["m3_neighborhood_probes"]),
+            "neighborhood_probe_candidates": len(neighborhood_candidates),
         },
         "excluded_records": {
-            "degenerate": [
-                e for e in excluded if e["reason"] == "degenerate_new_obsolete_overlap"
-            ],
+            "degenerate": degenerate,
             "prompt_mask": mask_exclusions,
             "note": (
                 "obsolete-only rows are not excluded from the dataset; they "
                 "are reclassified as persistence probes (see populations)"
             ),
         },
-        "sweep_populations": {
-            "m1_trained_fact_paraphrases": len(m1_rows),
-            "m3_persistence_probes": len(persistence_rows),
-            "m3_neighborhood_probes": len(neighborhood_rows),
-        },
-        # The full sweep populations are deterministically re-derivable from
-        # (dataset revision, salt, fractions, seed) — the manifest carries
-        # only counts plus a capped sample for auditability.
+        "train_provenance": train_provenance,
+        "sweep_populations": sweep_populations,
+        "sweep_selection": sweep_selection,
         "sweep_rows_sample": {
-            "m1_trained_fact_paraphrases": m1_rows[:200],
-            "m3_persistence_probes": persistence_rows[:200],
-            "m3_neighborhood_probes": neighborhood_rows[:200],
+            family: rows[:200]
+            for family, rows in sweep_populations.items()
         },
         "notes": [
-            "One training example per valid new object; exact duplicate "
-            "(prompt, answer) pairs removed.",
+            "Strict train/val/test separation: one partition per subject; "
+            "training prompts (update or generalization) never appear in "
+            "validation or test; val/test collisions resolve in favour of "
+            "test (dropped from val).",
+            "Perplexity is disabled for this dataset: a defensible "
+            "multi-reference likelihood is not implemented; no empty or "
+            "obsolete completion enters the loss. TemporalWiki perplexity "
+            "is unchanged.",
+            "M1 (update efficacy) applies ONLY to facts whose update "
+            "prompt was trained; M2 measures held-out transfer; M3 "
+            "measures retention and locality.",
             "subject_popularity is constant per subject and is never used "
             "to rank candidate objects within a row.",
-            "Degenerate new/obsolete overlap is 0 under the frozen target "
-            "normalization (strip '+', strip whitespace); 2 rows overlap "
-            "only after case/punctuation folding and are harmless.",
-            "Prompt masking: validation/test prompts colliding with train "
-            "prompts are dropped; val/test collisions resolve in favour of "
-            "test; facts losing all prompts are excluded (recorded).",
-            "Neighborhood probes exclude every fact key belonging to any "
-            "dataset partition and are deduplicated by fact key.",
-            "The original attempt-1 interruption of e7-static-r9-s42 is "
-            "unrelated to this adapter; see the Static-R9 recovery reports.",
         ],
     }
     return events, manifest
@@ -611,15 +785,14 @@ def prepare_wikifactdiff_events(
     *,
     train_limit: int | None = None,
     seed: int = 42,
+    mode: str | None = None,
     dataset_config: dict[str, Any] | None = None,
 ) -> tuple[list, dict]:
     """HF-backed entry point (dispatched from ``cycleft.e1.data``)."""
     from datasets import load_dataset
 
     config = dict(dataset_config or {})
-    eval_population = config.get("eval_population", "full")
-    pilot_eval_per_event = int(config.get("pilot_eval_per_event", 100))
-    hf_revision = config.get("revision", DATASET_REVISION)
+    hf_revision = str(config.pop("revision", DATASET_REVISION))
 
     dataset = load_dataset(
         DATASET_ID,
@@ -632,8 +805,8 @@ def prepare_wikifactdiff_events(
         rows,
         seed=seed,
         train_limit=train_limit,
-        eval_population=eval_population,
-        pilot_eval_per_event=pilot_eval_per_event,
+        mode=mode,
+        adapter_config=config,
     )
     manifest["dataset_fingerprint"] = {
         "hf_fingerprint": getattr(dataset, "_fingerprint", None),

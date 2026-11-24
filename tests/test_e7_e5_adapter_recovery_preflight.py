@@ -216,15 +216,19 @@ def test_predict_uses_resolved_device_passthrough(env, v5_specs):
 
 
 def test_resolve_device_rejects_silent_cpu_fallback(monkeypatch):
+    """Policy updated 2026-11-23 (HPC readiness Phase 1): explicit
+    accelerator requests fail hard (MPS unavailable -> RuntimeError;
+    CUDA unavailable -> RuntimeError); CPU remains opt-in only; the
+    AUTOMATIC path may end on CPU as its documented last resort."""
     from cycleft.e1.lm import resolve_device
     monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
     with pytest.raises(RuntimeError, match="CPU fallback"):
-        resolve_device(None)
-    with pytest.raises(RuntimeError, match="CPU fallback"):
-        resolve_device("mps")
+        resolve_device("mps")          # explicit accelerator: no downgrade
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="CUDA was requested"):
+        resolve_device("cuda")         # explicit accelerator: no downgrade
     assert resolve_device("cpu") == torch.device("cpu")  # explicit opt-in only
-    with pytest.raises(ValueError):
-        resolve_device("cuda")
+    assert resolve_device(None) == torch.device("cpu")   # auto last resort
 
 
 # 6: exact inference-configuration mapping (train path == sweep path).

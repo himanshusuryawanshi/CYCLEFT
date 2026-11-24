@@ -63,7 +63,43 @@ from __future__ import annotations
 import collections
 from typing import Any, Callable
 
+import time
+
 from cycleft.data.base import stable_hash
+
+
+class _PhaseTimer:
+    """Records per-phase wall time and row counts into the manifest.
+
+    Permanent instrumentation (HPC readiness Task 2): the timing table is
+    part of the dataset manifest so integration performance is auditable
+    on every machine.
+    """
+
+    def __init__(self) -> None:
+        self._start = time.perf_counter()
+        self.phases: dict[str, dict[str, Any]] = {}
+
+    def __init__(self, log=None) -> None:
+        self._t0 = time.perf_counter()
+        self._last = self._t0
+        self._log = log or (lambda m: print(m, flush=True))
+        self.phases: dict[str, dict[str, Any]] = {}
+
+    def mark(self, phase: str, records: int = 0, objects: int = 0) -> None:
+        now = time.perf_counter()
+        phase_s = now - self._last
+        total_s = now - self._t0
+        self.phases[phase] = {
+            "elapsed_s": round(total_s, 3),
+            "phase_s": round(phase_s, 3),
+            "records": records,
+            "objects_created": objects,
+        }
+        self._log(
+            f"[wfd-timer] {phase}: phase={phase_s:.1f}s "
+            f"total={total_s:.1f}s records={records} objects={objects}")
+        self._last = now
 
 DATASET_ID = "Orange/WikiFactDiff"
 DATASET_CONFIG_NAME = "20210104-20230227_legacy"
@@ -257,6 +293,7 @@ def build_wikifactdiff_events(
     train_limit: int | None = None,
     mode: str | None = None,
     adapter_config: dict[str, Any] | None = None,
+    log=None,
 ) -> tuple[list, dict]:
     """Pure event-construction core (no HF access) — unit-testable.
 
@@ -267,7 +304,9 @@ def build_wikifactdiff_events(
     does not pin one explicitly; requesting ``pilot`` populations in
     ``full`` mode is a configuration error (never a silent downgrade).
     """
+    timer = _PhaseTimer(log=log or (lambda m: print(f'[wfd] {m}', flush=True)))
     config = validate_adapter_config(dict(adapter_config or {}))
+    timer.mark("config_validation")
     fractions = tuple(config.get("split_fractions", SPLIT_FRACTIONS))
     salt = str(config.get("salt", PARTITION_SALT))
     configured_population = config.get("eval_population")
@@ -294,6 +333,7 @@ def build_wikifactdiff_events(
     if train_limit is not None and train_limit <= 0:
         raise ValueError(f"train_limit must be positive or None, got {train_limit!r}")
 
+    timer.mark("schema_rows_materialized", records=len(rows))
     assignment = assign_partitions(rows, salt=salt, fractions=fractions)
     partition_subjects = collections.Counter(assignment.values())
     partition_facts = collections.Counter(
@@ -320,6 +360,7 @@ def build_wikifactdiff_events(
             )
         elif not new_labels and obsolete_labels:
             persistence_fact_keys.add(fk)
+    timer.mark("classification_and_exclusions", records=len(rows))
     degenerate_keys = {tuple(e["fact_key"].split("|", 1)) for e in degenerate}
     partition_fact_keys = {_fact_key(r) for r in rows}
     # NOTE: obsolete-only rows are NOT excluded from the dataset — they are
@@ -362,6 +403,10 @@ def build_wikifactdiff_events(
         else:
             raw_test_rows[tag].append((row_index, row))
 
+    timer.mark("training_expansion", records=len(train_pool_by_event["wfd_e1_insertion"])
+               + len(train_pool_by_event["wfd_e2_other_update"])
+               + len(train_pool_by_event["wfd_e3_replacement"]),
+               objects=expanded_total)
     # deduplicate exact (question, object) pairs within each event pool
     event_train_expanded: dict[str, list[dict]] = {}
     dedup_removed = 0
@@ -449,13 +494,16 @@ def build_wikifactdiff_events(
                         prompt_kind="generalization_prompt",
                         perplexity_disabled=True))
 
-    # val: masked against train AND final-test prompts (test is protected)
+    # val: masked against train AND final-test prompts (test is protected).
+    # The blocked set is computed ONCE — a per-fact union of ~1.5M-element
+    # sets was measured at 8,550 s for ~30k facts (HPC readiness Task 2).
     final_val_rows: dict[str, list[dict]] = {tag: [] for tag in EVENT_TAGS}
     val_facts_dropped = 0
+    val_blocked_prompts = train_all_prompts | final_test_prompts
     for tag in EVENT_TAGS:
         for row_index, row in raw_val_rows[tag]:
             fk = _fact_key(row)
-            blocked = train_all_prompts | final_test_prompts
+            blocked = val_blocked_prompts
             upd_kept, upd_dropped = _masked(
                 [row["update_prompt"]], blocked,
                 "train_or_test_prompt_collision", fk, "val")
@@ -489,6 +537,9 @@ def build_wikifactdiff_events(
                         prompt_kind="generalization_prompt",
                         perplexity_disabled=True))
 
+    timer.mark("eval_population_construction", records=len(final_test_rows["wfd_e1_insertion"])
+               + len(final_test_rows["wfd_e2_other_update"])
+               + len(final_test_rows["wfd_e3_replacement"]))
     # pilot sampling: independent deterministic samples for test and val
     if eval_population == "pilot":
         from cycleft.e1.data import deterministic_subset
@@ -698,6 +749,8 @@ def build_wikifactdiff_events(
         "neighborhood", len(neighborhood_candidates),
         lambda i: _materialize_neighborhood(*neighborhood_candidates[i]),
         len(neighborhood_candidates))
+    timer.mark("sweep_materialization",
+               objects=sum(len(v) for v in sweep_populations.values()))
 
     manifest = {
         "dataset_id": DATASET_ID,
@@ -756,6 +809,7 @@ def build_wikifactdiff_events(
             ),
         },
         "train_provenance": train_provenance,
+        "performance": timer.phases,
         "sweep_populations": sweep_populations,
         "sweep_selection": sweep_selection,
         "sweep_rows_sample": {

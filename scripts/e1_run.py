@@ -30,8 +30,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-examples", type=int, default=None,
                         help="Override the per-event training limit")
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--device", choices=["mps", "cpu"], default=None,
-                        help="cpu must be requested explicitly (no silent fallback)")
+    parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"],
+                        default=None,
+                        help="auto = CUDA > MPS > CPU; an explicitly requested "
+                             "accelerator fails hard when unavailable (no "
+                             "silent fallback)")
     parser.add_argument("--start-event", type=int, choices=[1, 2, 3], default=1,
                         help="Resume the stream at this event (requires prior "
                              "checkpoints and baseline in the run directory)")

@@ -78,21 +78,89 @@ class LMRuntimeConfig:
 
 
 def resolve_device(requested: str | None = None) -> torch.device:
-    """Resolve the compute device. MPS is preferred; CPU is opt-in only.
+    """Resolve the compute device.
 
-    A silent CPU fallback is deliberately disallowed: results must never
-    be reported as an MPS run if they ran on CPU.
+    Resolution rules:
+
+    * ``requested="cpu"``  -> CPU (explicit opt-in, always allowed).
+    * ``requested="cuda"`` -> CUDA, or an explicit RuntimeError when no
+      CUDA device is available (never a silent downgrade).
+    * ``requested="mps"``  -> Apple MPS, or an explicit RuntimeError when
+      unavailable (never a silent downgrade).
+    * ``requested=None/"auto"`` -> automatic selection preferring CUDA,
+      then MPS, then CPU (HPC-first ordering; CPU is the last resort of
+      the *automatic* path only — an explicitly requested accelerator is
+      never silently downgraded).
+
+    Results must never be reported as an accelerator run if they ran on
+    CPU: the resolved device is recorded in every manifest.
     """
-    if requested == "cpu":
+    requested_normalized = (requested or "auto").lower()
+    if requested_normalized == "cpu":
         return torch.device("cpu")
-    if requested in (None, "mps"):
+    if requested_normalized == "cuda":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        raise RuntimeError(
+            "CUDA was requested but is not available "
+            f"(torch.cuda.is_available()=False, torch={torch.__version__}). "
+            "No silent fallback: pass device='cpu' explicitly or fix CUDA."
+        )
+    if requested_normalized == "mps":
         if torch.backends.mps.is_available():
             return torch.device("mps")
         raise RuntimeError(
             "Apple MPS is not available and automatic CPU fallback is "
             "disabled. Pass device='cpu' explicitly to run on CPU."
         )
+    if requested_normalized == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
     raise ValueError(f"Unsupported device requested: {requested!r}")
+
+
+def gpu_metadata() -> dict:
+    """GPU/CUDA metadata for run manifests (all None when CUDA is absent).
+
+    Distinguishes *measured* fields (name, capabilities) from fields that
+    require an active CUDA context.  Never raises.
+    """
+    info: dict[str, Any] = {
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_runtime_version": torch.version.cuda,
+        "torch_version": torch.__version__,
+        "device_name": None,
+        "device_capability": None,
+        "total_memory_bytes": None,
+        "free_memory_bytes": None,
+        "device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+    }
+    if torch.cuda.is_available():
+        try:
+            index = torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(index)
+            info["device_name"] = props.name
+            info["device_capability"] = f"{props.major}.{props.minor}"
+            info["total_memory_bytes"] = props.total_memory
+            free, _total = torch.cuda.mem_get_info(index)
+            info["free_memory_bytes"] = free
+        except Exception as error:  # pragma: no cover - metadata only
+            info["metadata_error"] = str(error)
+    return info
+
+
+def release_device_memory(device: torch.device | str | None = None) -> None:
+    """Free accelerator caches between stages (MPS + CUDA aware)."""
+    if isinstance(device, str):
+        device = torch.device(device)
+    if torch.cuda.is_available() and (device is None or device.type == "cuda"):
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    if torch.backends.mps.is_available() and (device is None or device.type == "mps"):
+        torch.mps.empty_cache()
 
 
 def set_seed(seed: int) -> None:
@@ -105,12 +173,23 @@ def set_seed(seed: int) -> None:
 
 
 def memory_status() -> dict:
-    """Snapshot of MPS allocator usage and process RSS."""
+    """Snapshot of accelerator allocator usage and process RSS."""
     status: dict = {"rss_gb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e9}
     if torch.backends.mps.is_available():
         status["mps_allocated_gb"] = torch.mps.current_allocated_memory() / 1e9
         if hasattr(torch.mps, "recommended_max_memory"):
             status["mps_recommended_gb"] = torch.mps.recommended_max_memory() / 1e9
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        status["cuda_allocated_gb"] = allocated / 1e9
+        status["cuda_reserved_gb"] = reserved / 1e9
+        try:
+            free, total = torch.cuda.mem_get_info()
+            status["cuda_free_gb"] = free / 1e9
+            status["cuda_total_gb"] = total / 1e9
+        except Exception:  # pragma: no cover - informational only
+            pass
     return status
 
 

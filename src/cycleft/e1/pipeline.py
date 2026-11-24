@@ -33,10 +33,12 @@ from cycleft.e1.lm import (
     LMRuntimeConfig,
     attach_lora,
     evaluate_event,
+    gpu_metadata,
     load_adapter_for_training,
     load_base_model,
     load_tokenizer,
     memory_status,
+    release_device_memory,
     resolve_device,
     set_seed,
     train_event,
@@ -238,7 +240,10 @@ class E1Run:
             {
                 **software_versions(),
                 "device": str(self.device),
+                "device_requested": self.lm_config.device,
                 "mps_available": torch.backends.mps.is_available(),
+                "gpu": gpu_metadata(),
+                "memory": memory_status(),
                 "precision": self.lm_config.dtype,
             },
         )
@@ -248,8 +253,7 @@ class E1Run:
     def _release(self, model, tokenizer) -> None:
         del model
         del tokenizer
-        if torch.backends.mps.is_available():
-            torch.mps.empty_cache()
+        release_device_memory(self.device)
 
     def run_baseline(self, events: list[PreparedEvent]) -> dict:
         self.log("Stage 0: baseline evaluation of the pretrained model")
